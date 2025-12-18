@@ -3,7 +3,7 @@
 import mongochain
 
 # Set MongoDB connection string (do this once at the start)
-CONNECTION_STRING = "mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority"
+CONNECTION_STRING = ""
 mongochain.set_connection_string(CONNECTION_STRING)
 
 # Create an agent with MongoDB memory
