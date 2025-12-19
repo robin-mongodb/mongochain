@@ -38,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/robinvarghese/mongochain"
-Documentation = "https://github.com/robinvarghese/mongochain#readme"
-Repository = "https://github.com/robinvarghese/mongochain"
+Homepage = "https://github.com/robin-mongodb/mongochain"
+Documentation = "https://github.com/robin-mongodb/mongochain#readme"
+Repository = "https://github.com/robin-mongodb/mongochain"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mongochain"]

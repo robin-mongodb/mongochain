@@ -17,7 +17,7 @@ A simple Python agent framework that uses **MongoDB Atlas** as the memory layer,
 ## Installation
 
 ```bash
-pip install mongochain
+pip install git+https://github.com/robin-mongodb/mongochain.git
 ```
 
 Or install from source:

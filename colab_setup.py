@@ -3,7 +3,7 @@
 Run this in your first Colab cell:
 
 !pip install pymongo voyageai openai anthropic google-generativeai
-!pip install git+https://github.com/robinvarghese/mongochain.git
+!pip install git+https://github.com/robin-mongodb/mongochain.git
 
 Or for local development:
 !pip install -e /path/to/mongochain
