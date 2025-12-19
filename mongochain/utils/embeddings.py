@@ -95,6 +95,39 @@ class VoyageEmbeddings(EmbeddingProvider):
         return result.embeddings[0]
 
 
+def get_embedding_dimensions(model: str) -> int:
+    """
+    Get the number of dimensions for an embedding model.
+    
+    Args:
+        model: Model name (e.g., "text-embedding-3-small", "voyage-3")
+    
+    Returns:
+        Number of dimensions for the embedding model
+    
+    Raises:
+        ValueError: If model is not recognized
+    """
+    model_lower = model.lower()
+    
+    # OpenAI models
+    if "text-embedding-3-small" in model_lower:
+        return 1536
+    elif "text-embedding-3-large" in model_lower:
+        return 3072
+    elif "text-embedding-ada-002" in model_lower:
+        return 1536
+    # Voyage AI models
+    elif "voyage-3" in model_lower:
+        return 1024
+    elif "voyage-lite-02" in model_lower or "voyage-lite" in model_lower:
+        return 1024
+    else:
+        # Default to 1536 for unknown models (most common)
+        # User can override if needed
+        return 1536
+
+
 def get_embedding_provider(model: str, api_key: Optional[str] = None) -> EmbeddingProvider:
     """
     Get appropriate embedding provider based on model name.

@@ -3,8 +3,9 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, OperationFailure
 from mongochain.core.schemas import SearchResult
+from mongochain.utils.embeddings import get_embedding_dimensions
 
 
 class MongoMemoryStore:
@@ -79,6 +80,99 @@ class MongoMemoryStore:
         episodes.create_index([("success_score", DESCENDING)])
         
         print(f"  ✓ Indexes created")
+        
+        # Create vector search indexes
+        self._create_vector_indexes()
+    
+    def _create_vector_indexes(self):
+        """
+        Create vector search indexes for collections that store embeddings.
+        
+        Creates vector indexes for:
+        - short_term_memory: on 'embedding' field
+        - user_profiles: on 'memories.embedding' field (nested array)
+        """
+        try:
+            # Get embedding dimensions based on model
+            dimensions = get_embedding_dimensions(self.embedding_model)
+            
+            # Create vector index for short_term_memory collection
+            self._create_vector_index_for_collection(
+                collection_name=self.SHORT_TERM_COLLECTION,
+                index_name="vector_index",
+                field_path="embedding",
+                dimensions=dimensions
+            )
+            
+            # Create vector index for user_profiles collection (nested in memories array)
+            self._create_vector_index_for_collection(
+                collection_name=self.USER_PROFILES_COLLECTION,
+                index_name="vector_index",
+                field_path="memories.embedding",
+                dimensions=dimensions
+            )
+            
+            print(f"  ✓ Vector indexes created (dimensions: {dimensions})")
+        except Exception as e:
+            # Don't fail initialization if vector index creation fails
+            # (e.g., if not using Atlas or vector search not available)
+            print(f"  ⚠ Vector index creation skipped: {e}")
+            print(f"    (Vector search requires MongoDB Atlas with vector search enabled)")
+    
+    def _create_vector_index_for_collection(
+        self,
+        collection_name: str,
+        index_name: str,
+        field_path: str,
+        dimensions: int
+    ):
+        """
+        Create a vector search index for a collection.
+        
+        Args:
+            collection_name: Name of the collection
+            index_name: Name for the vector index
+            field_path: Path to the embedding field (e.g., "embedding" or "memories.embedding")
+            dimensions: Number of dimensions in the embedding vectors
+        """
+        try:
+            # Check if index already exists
+            existing_indexes = self.db.command({
+                "listSearchIndexes": collection_name
+            })
+            for idx in existing_indexes.get("indexes", []):
+                if idx.get("name") == index_name:
+                    # Index already exists, skip creation
+                    return
+            
+            # Create vector search index definition
+            index_definition = {
+                "name": index_name,
+                "definition": {
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "path": field_path,
+                            "numDimensions": dimensions,
+                            "similarity": "cosine"
+                        }
+                    ]
+                }
+            }
+            
+            # Create the vector search index
+            # Note: This requires MongoDB Atlas with vector search enabled
+            self.db.command({
+                "createSearchIndexes": collection_name,
+                "indexes": [index_definition]
+            })
+        except OperationFailure as e:
+            # Handle case where vector search is not available
+            # (e.g., not using Atlas, or feature not enabled)
+            if "vector" in str(e).lower() or "search" in str(e).lower():
+                raise
+            # Re-raise other operation failures
+            raise
     
     def store_memory(
         self,
