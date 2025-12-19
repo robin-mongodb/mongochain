@@ -1,15 +1,18 @@
 # Mongochain
 
-A simple Python agent framework that uses **MongoDB Atlas** as the memory layer, demonstrating how MongoDB can power stateful AI agents with multiple memory types.
+A simple Python agent framework that uses **MongoDB Atlas** as the memory layer, demonstrating how MongoDB can power stateful AI agents with user-specific memories.
 
 ## Features
 
-- **Multiple Memory Types**: Short-term, long-term, and conversation history
-- **Persona Management**: Create agents with personalities that can be changed dynamically
-- **Multi-Provider LLM Support**: Works with OpenAI, Anthropic Claude, and Google Gemini
-- **Vector Search**: Semantic memory retrieval using MongoDB Atlas Vector Search
-- **Multi-Agent Collaboration**: Agents can share memories with authorized collaborators
-- **Voyage AI Embeddings**: High-quality embeddings for semantic search
+- **User-Specific Memory**: All memories tied to user email/ID
+- **Three Memory Types**:
+  - `conversation_history` - Raw chat log with embeddings (90-day TTL)
+  - `short_term_memory` - Session summaries (7-day TTL)
+  - `long_term_memory` - Persistent user facts (no TTL, vector search)
+- **Auto-Extraction**: LLM automatically extracts and stores user facts
+- **Dynamic Personas**: Change agent personality on the fly
+- **Multi-Provider LLM**: Works with OpenAI, Anthropic, and Google
+- **Multi-Agent Collaboration**: Agents can share user memories
 
 ## Installation
 
@@ -28,7 +31,7 @@ pip install -e .
 ```python
 from mongochain import MongoAgent
 
-# Create an agent with OpenAI (default)
+# Create an agent
 agent = MongoAgent(
     name="assistant",
     persona="You are a helpful research assistant.",
@@ -36,77 +39,131 @@ agent = MongoAgent(
     voyage_api_key="voy-...",
     llm_api_key="sk-..."
 )
-# Output: "Agent: assistant created. Check database 'assistant' in your MongoDB cluster."
 
-# Chat with the agent
-response = agent.chat("Hello! What can you help me with?")
+# Chat requires a user_id (email)
+response = agent.chat(
+    user_id="user@example.com",
+    message="Hi! I'm a DevOps engineer working on MongoDB optimization."
+)
 print(response)
 
-# Change persona dynamically
-agent.set_persona("You are a grumpy professor who gives very brief answers.")
-response = agent.chat("Explain machine learning")  # Different tone!
+# The agent automatically extracts and stores user facts!
+# Check what it learned:
+memories = agent.get_user_memories("user@example.com")
+for m in memories:
+    print(f"- {m['content']}")
 ```
 
-## Using Different LLM Providers
+## Memory Architecture
+
+Each agent creates a MongoDB database with three collections:
+
+| Collection             | Purpose                  | TTL     | Features              |
+| ---------------------- | ------------------------ | ------- | --------------------- |
+| `conversation_history` | Raw chat with embeddings | 90 days | Vector search enabled |
+| `short_term_memory`    | Session summaries        | 7 days  | Vector search enabled |
+| `long_term_memory`     | Persistent user facts    | None    | Vector search enabled |
+
+All memories are **user-specific** (filtered by `user_id`).
+
+## Storing User Memories
+
+### Automatic (via LLM)
+
+The agent automatically extracts significant facts from conversations:
 
 ```python
-# Anthropic Claude
-agent = MongoAgent(
-    name="claude_agent",
-    persona="You are a coding assistant.",
-    mongo_uri="mongodb+srv://...",
-    voyage_api_key="voy-...",
-    llm_api_key="sk-ant-...",
-    llm_provider="anthropic"
-)
+# User mentions their job - automatically stored
+agent.chat("user@example.com", "I'm a senior engineer at Acme Corp")
+```
 
-# Google Gemini
-agent = MongoAgent(
-    name="gemini_agent",
-    persona="You are a creative writer.",
-    mongo_uri="mongodb+srv://...",
-    voyage_api_key="voy-...",
-    llm_api_key="AIza...",
-    llm_provider="google",
-    llm_model="gemini-1.5-pro"  # Optional: override default model
+### Manual
+
+```python
+# Store a specific fact
+agent.store_user_memory(
+    user_id="user@example.com",
+    content="User prefers detailed technical explanations",
+    category="preference"
 )
+```
+
+## Dynamic Personas
+
+```python
+# Change persona on the fly
+agent.set_persona("You are a grumpy professor who gives brief answers.")
+response = agent.chat("user@example.com", "Explain indexing")
+
+agent.set_persona("You are a pirate who explains things with nautical metaphors.")
+response = agent.chat("user@example.com", "Explain indexing")  # Different style!
 ```
 
 ## Multi-Agent Collaboration
 
 ```python
-# Create first agent
+# Create Alice - a research specialist
 alice = MongoAgent(
     name="alice",
     persona="You are a research specialist.",
-    mongo_uri="mongodb+srv://...",
-    voyage_api_key="voy-...",
-    llm_api_key="sk-..."
+    mongo_uri=MONGO_URI,
+    voyage_api_key=VOYAGE_KEY,
+    llm_api_key=LLM_KEY
 )
 
-# Create second agent with access to Alice's memories
+# Create Bob - can access Alice's memories
 bob = MongoAgent(
     name="bob",
     persona="You are a summarization expert.",
-    mongo_uri="mongodb+srv://...",
-    voyage_api_key="voy-...",
-    llm_api_key="sk-...",
-    collaborators=["alice"]  # Bob can read Alice's long-term memories
+    mongo_uri=MONGO_URI,
+    voyage_api_key=VOYAGE_KEY,
+    llm_api_key=LLM_KEY,
+    collaborators=["alice"]  # Bob can read Alice's user memories
 )
 
-# Bob can now reference Alice's knowledge
-response = bob.chat("What has Alice been researching?")
+# Bob can now access what Alice knows about users
+response = bob.chat("user@example.com", "What has Alice learned about me?")
 ```
 
-## Memory Architecture
+## Using Different LLM Providers
 
-Each agent gets its own MongoDB database with three collections:
+```python
+# OpenAI (default)
+agent = MongoAgent(name="assistant", llm_provider="openai", ...)
 
-| Collection             | Purpose          | Features              |
-| ---------------------- | ---------------- | --------------------- |
-| `short_term_memory`    | Recent context   | TTL auto-expiry       |
-| `long_term_memory`     | Persistent facts | Vector search enabled |
-| `conversation_history` | Full chat log    | Timestamp indexed     |
+# Anthropic Claude
+agent = MongoAgent(
+    name="assistant",
+    llm_provider="anthropic",
+    llm_api_key="sk-ant-...",
+    ...
+)
+
+# Google Gemini
+agent = MongoAgent(
+    name="assistant",
+    llm_provider="google",
+    llm_api_key="AIza...",
+    llm_model="gemini-1.5-pro",  # Optional: override default model
+    ...
+)
+```
+
+## Session Management
+
+```python
+# End session to save summary to short-term memory
+agent.end_session("user@example.com")
+
+# Get user stats
+stats = agent.get_user_stats("user@example.com")
+print(f"Conversations: {stats['conversation_count']}")
+print(f"Short-term summaries: {stats['short_term_count']}")
+print(f"Long-term facts: {stats['long_term_count']}")
+
+# Clear user memories
+agent.clear_user_memories("user@example.com", memory_type="conversation")
+```
 
 ## Requirements
 

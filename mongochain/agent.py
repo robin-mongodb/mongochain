@@ -1,5 +1,6 @@
 """Main MongoAgent class for mongochain."""
 
+import json
 from typing import Optional
 
 from .config import AgentConfig, MemoryConfig
@@ -12,7 +13,12 @@ class MongoAgent:
     """An AI agent with MongoDB-backed memory.
     
     Each agent gets its own MongoDB database with separate collections for
-    different memory types (short-term, long-term, conversation history).
+    different memory types. All memories are user-specific (by email/ID).
+    
+    Memory Types:
+    - conversation_history: Raw chat log with embeddings (90-day TTL)
+    - short_term_memory: Session summaries (7-day TTL)
+    - long_term_memory: Persistent user facts (no TTL)
     
     Attributes:
         name: Agent name
@@ -45,7 +51,6 @@ class MongoAgent:
             collaborators: List of agent names this agent can read memories from
             memory_config: Optional memory configuration
         """
-        # Store configuration
         self._config = AgentConfig(
             name=name,
             persona=persona,
@@ -75,6 +80,9 @@ class MongoAgent:
             config=memory_config
         )
         
+        # Track current session for summarization
+        self._session_messages: dict[str, list] = {}  # user_id -> messages
+        
         # Setup database and collections
         self._setup()
     
@@ -82,59 +90,85 @@ class MongoAgent:
         """Setup the agent's database and collections."""
         status = self._memory.setup_collections()
         
-        # Print confirmation message
         print(f"Agent: {self.name} created. Check database '{self._config.db_name}' in your MongoDB cluster.")
         
         if status["collections_created"]:
             print(f"  Collections created: {', '.join(status['collections_created'])}")
-        if status["vector_index_status"]:
-            print(f"  {status['vector_index_status']}")
+        for vs in status["vector_index_status"]:
+            print(f"  Vector index - {vs}")
     
-    def chat(self, message: str) -> str:
+    def chat(self, user_id: str, message: str) -> str:
         """Send a message and get a response.
         
-        The agent will:
-        1. Store the message in conversation history
-        2. Retrieve relevant context from all memory types
-        3. Include collaborator memories if authorized
-        4. Generate a response using the LLM
-        5. Store the response and update memories
-        
         Args:
+            user_id: User's email or unique identifier
             message: The user's message
             
         Returns:
             The agent's response
         """
-        # Store user message in conversation history
-        self._memory.store_conversation("user", message)
+        # Initialize session tracking for this user if needed
+        if user_id not in self._session_messages:
+            self._session_messages[user_id] = []
         
-        # Store in short-term memory
-        self._memory.store_short_term(f"User said: {message}")
+        # Generate embedding for the user message
+        message_embedding = self._embeddings.embed(message)
         
-        # Build context from memories
-        context = self._build_context(message)
+        # Store user message in conversation history (with embedding)
+        self._memory.store_conversation(
+            user_id=user_id,
+            role="user",
+            content=message,
+            embedding=message_embedding
+        )
+        
+        # Track in session
+        self._session_messages[user_id].append({"role": "user", "content": message})
+        
+        # Build context from all memory sources
+        context = self._build_context(user_id, message, message_embedding)
         
         # Build messages for LLM
-        messages = self._build_messages(message, context)
+        messages = self._build_messages(user_id, message, context)
         
         # Get response from LLM
-        response = self._llm.chat(messages, system_prompt=self._build_system_prompt())
+        response = self._llm.chat(messages, system_prompt=self._build_system_prompt(user_id, context))
         
-        # Store assistant response
-        self._memory.store_conversation("assistant", response)
-        self._memory.store_short_term(f"Assistant said: {response}")
+        # Generate embedding for the response
+        response_embedding = self._embeddings.embed(response)
         
-        # Extract and store any important information in long-term memory
-        self._update_long_term_memory(message, response)
+        # Store assistant response (with embedding)
+        self._memory.store_conversation(
+            user_id=user_id,
+            role="assistant",
+            content=response,
+            embedding=response_embedding
+        )
+        
+        # Track in session
+        self._session_messages[user_id].append({"role": "assistant", "content": response})
+        
+        # Extract and store user facts in long-term memory (async-like, non-blocking conceptually)
+        self._extract_and_store_user_facts(user_id, message, response)
+        
+        # Update short-term summary periodically (every 5 exchanges)
+        if len(self._session_messages[user_id]) >= 10:  # 5 user + 5 assistant
+            self._update_short_term_summary(user_id)
         
         return response
     
-    def _build_context(self, query: str) -> dict:
+    def _build_context(
+        self,
+        user_id: str,
+        query: str,
+        query_embedding: list[float]
+    ) -> dict:
         """Build context from all memory sources.
         
         Args:
-            query: The current query to find relevant memories
+            user_id: User's email/ID
+            query: The current query
+            query_embedding: Embedding of the query
             
         Returns:
             Dict with context from each memory type
@@ -146,49 +180,39 @@ class MongoAgent:
             "collaborator_memories": {}
         }
         
-        # Get short-term context
-        short_term = self._memory.get_recent_context()
-        context["short_term"] = [m["content"] for m in short_term]
+        # Get recent short-term summaries (what happened recently)
+        short_term = self._memory.search_short_term(user_id, query_embedding, limit=3)
+        context["short_term"] = short_term
         
-        # Get relevant long-term memories via vector search
-        try:
-            query_embedding = self._embeddings.embed_query(query)
-            long_term = self._memory.search_long_term(query_embedding)
-            context["long_term"] = [m["content"] for m in long_term]
-        except Exception:
-            # Fallback if vector search fails
-            pass
+        # Get relevant long-term memories (user facts)
+        long_term = self._memory.search_long_term(user_id, query_embedding)
+        context["long_term"] = long_term
         
-        # Get conversation history
-        conversation = self._memory.get_conversation_history()
+        # Get recent conversation history
+        conversation = self._memory.get_conversation_history(user_id, limit=10)
         context["conversation"] = [
             {"role": m["role"], "content": m["content"]}
             for m in conversation
         ]
         
-        # Get collaborator memories
+        # Get collaborator memories if any
         for collab_name in self.collaborators:
             try:
-                collab_memories = self._get_collaborator_memories(collab_name, query)
+                collab_memories = self._get_collaborator_memories(collab_name, user_id, query_embedding)
                 if collab_memories:
                     context["collaborator_memories"][collab_name] = collab_memories
             except Exception:
-                # Skip if collaborator DB doesn't exist
                 pass
         
         return context
     
-    def _get_collaborator_memories(self, agent_name: str, query: str) -> list[str]:
-        """Get relevant memories from a collaborator agent.
-        
-        Args:
-            agent_name: Name of the collaborator agent
-            query: Query to find relevant memories
-            
-        Returns:
-            List of relevant memory contents
-        """
-        # Create a temporary memory store for the collaborator
+    def _get_collaborator_memories(
+        self,
+        agent_name: str,
+        user_id: str,
+        query_embedding: list[float]
+    ) -> list[dict]:
+        """Get relevant memories from a collaborator agent."""
         collab_config = AgentConfig(
             name=agent_name,
             persona="",
@@ -203,67 +227,68 @@ class MongoAgent:
         )
         
         try:
-            # Try vector search first
-            query_embedding = self._embeddings.embed_query(query)
-            memories = collab_memory.search_long_term(query_embedding, limit=3)
-            return [m["content"] for m in memories]
+            memories = collab_memory.search_long_term(user_id, query_embedding, limit=3)
+            return memories
         except Exception:
-            # Fallback to recent memories
-            memories = collab_memory.get_all_long_term(limit=3)
-            return [m["content"] for m in memories]
+            return collab_memory.get_user_long_term(user_id, limit=3)
         finally:
             collab_memory.close()
     
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt for the LLM."""
-        return f"""You are an AI agent named {self.name}.
+    def _build_system_prompt(self, user_id: str, context: dict) -> str:
+        """Build the system prompt including user context."""
+        base_prompt = f"""You are an AI agent named {self.name}.
 
 {self.persona}
 
-You have access to memories from past conversations and can recall relevant information.
-When referencing information from your memories, integrate it naturally into your responses."""
-    
-    def _build_messages(self, current_message: str, context: dict) -> list[dict]:
-        """Build the message list for the LLM.
+You have access to memories about this user and past conversations.
+When you learn something significant about the user (preferences, facts about them, their work, skills, etc.), 
+naturally incorporate this knowledge into your responses."""
+
+        # Add user facts from long-term memory
+        if context["long_term"]:
+            facts = "\n".join(f"- {m['content']}" for m in context["long_term"])
+            base_prompt += f"\n\nWhat you know about this user:\n{facts}"
         
-        Args:
-            current_message: The current user message
-            context: Context from memory retrieval
-            
-        Returns:
-            List of message dicts for the LLM
-        """
+        # Add recent session context from short-term memory
+        if context["short_term"]:
+            summaries = "\n".join(
+                f"- {m['summary']}" for m in context["short_term"]
+            )
+            base_prompt += f"\n\nRecent interactions with this user:\n{summaries}"
+        
+        return base_prompt
+    
+    def _build_messages(
+        self,
+        user_id: str,
+        current_message: str,
+        context: dict
+    ) -> list[dict]:
+        """Build the message list for the LLM."""
         messages = []
         
-        # Add context as a system-like message if we have relevant memories
-        context_parts = []
-        
-        if context["long_term"]:
-            context_parts.append(
-                "Relevant memories:\n" + 
-                "\n".join(f"- {m}" for m in context["long_term"])
-            )
-        
+        # Add collaborator context if available
         if context["collaborator_memories"]:
+            collab_context = []
             for collab_name, memories in context["collaborator_memories"].items():
                 if memories:
-                    context_parts.append(
-                        f"Memories from {collab_name}:\n" +
-                        "\n".join(f"- {m}" for m in memories)
+                    collab_context.append(
+                        f"Information from {collab_name}:\n" +
+                        "\n".join(f"- {m['content']}" for m in memories)
                     )
+            
+            if collab_context:
+                messages.append({
+                    "role": "user",
+                    "content": "[Shared knowledge from other agents]\n" + "\n\n".join(collab_context)
+                })
+                messages.append({
+                    "role": "assistant",
+                    "content": "I'll incorporate this shared knowledge in my response."
+                })
         
-        if context_parts:
-            messages.append({
-                "role": "user",
-                "content": "[Context from memory]\n" + "\n\n".join(context_parts)
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "I understand. I'll use this context to inform my response."
-            })
-        
-        # Add recent conversation history (skip the current message we just stored)
-        for msg in context["conversation"][:-1]:  # Exclude the message we just added
+        # Add recent conversation history (excluding current message)
+        for msg in context["conversation"][:-1] if context["conversation"] else []:
             messages.append({
                 "role": msg["role"],
                 "content": msg["content"]
@@ -277,95 +302,211 @@ When referencing information from your memories, integrate it naturally into you
         
         return messages
     
-    def _update_long_term_memory(self, user_message: str, assistant_response: str):
-        """Extract and store important information in long-term memory.
-        
-        This is a simple implementation that stores significant exchanges.
-        A more sophisticated version could use the LLM to extract key facts.
-        
-        Args:
-            user_message: The user's message
-            assistant_response: The assistant's response
-        """
-        # Store exchanges that seem important (longer responses often contain info)
-        if len(assistant_response) > 200:
-            # Create a summary of the exchange
-            summary = f"User asked about: {user_message[:100]}... Response covered: {assistant_response[:200]}..."
-            embedding = self._embeddings.embed(summary)
-            self._memory.store_long_term(
-                content=summary,
-                embedding=embedding,
-                metadata={
-                    "type": "exchange_summary",
-                    "user_message_preview": user_message[:100]
-                }
+    def _extract_and_store_user_facts(
+        self,
+        user_id: str,
+        user_message: str,
+        assistant_response: str
+    ):
+        """Use LLM to extract and store significant user facts."""
+        extraction_prompt = f"""Analyze this conversation exchange and extract any significant facts about the user.
+
+User message: {user_message}
+Assistant response: {assistant_response}
+
+Extract facts about the user such as:
+- Their job/role/profession
+- Their company or organization
+- Technical skills or expertise
+- Preferences or interests
+- Projects they're working on
+- Personal details they shared
+
+Return a JSON array of facts. Each fact should be a complete sentence.
+If there are no significant facts, return an empty array: []
+
+Example output: ["User works as a DevOps engineer", "User is interested in MongoDB optimization"]
+Only return the JSON array, nothing else."""
+
+        try:
+            result = self._llm.chat(
+                [{"role": "user", "content": extraction_prompt}],
+                system_prompt="You are a fact extraction assistant. Only output valid JSON arrays."
             )
+            
+            # Parse the JSON response
+            facts = json.loads(result.strip())
+            
+            if isinstance(facts, list) and facts:
+                for fact in facts:
+                    if isinstance(fact, str) and len(fact) > 10:
+                        # Check if similar fact already exists
+                        fact_embedding = self._embeddings.embed(fact)
+                        existing = self._memory.search_long_term(
+                            user_id, fact_embedding, limit=1
+                        )
+                        
+                        # Only store if no similar fact exists (score < 0.9)
+                        if not existing or existing[0].get("score", 0) < 0.9:
+                            self._memory.store_long_term(
+                                user_id=user_id,
+                                content=fact,
+                                embedding=fact_embedding,
+                                category="user_fact",
+                                metadata={"source": "auto_extracted"}
+                            )
+        except (json.JSONDecodeError, Exception):
+            # Silently fail - fact extraction is best-effort
+            pass
+    
+    def _update_short_term_summary(self, user_id: str):
+        """Generate and store a summary of the current session."""
+        if user_id not in self._session_messages or not self._session_messages[user_id]:
+            return
+        
+        messages = self._session_messages[user_id]
+        conversation_text = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:200]}" for m in messages[-10:]
+        )
+        
+        summary_prompt = f"""Summarize this conversation session concisely.
+
+{conversation_text}
+
+Provide a JSON response with:
+- "summary": A 1-2 sentence summary of what was discussed
+- "topics": Array of main topics discussed
+- "actions": Array of actions taken or outcomes
+
+Example:
+{{"summary": "Discussed MongoDB indexing strategies and helped debug a slow query.", "topics": ["MongoDB", "indexing", "performance"], "actions": ["explained compound indexes", "suggested query optimization"]}}
+
+Only return valid JSON."""
+
+        try:
+            result = self._llm.chat(
+                [{"role": "user", "content": summary_prompt}],
+                system_prompt="You are a conversation summarizer. Only output valid JSON."
+            )
+            
+            summary_data = json.loads(result.strip())
+            
+            summary_text = summary_data.get("summary", "Session summary")
+            summary_embedding = self._embeddings.embed(summary_text)
+            
+            self._memory.store_short_term(
+                user_id=user_id,
+                summary=summary_text,
+                topics_discussed=summary_data.get("topics", []),
+                actions_taken=summary_data.get("actions", []),
+                embedding=summary_embedding
+            )
+            
+            # Clear session messages after summarizing
+            self._session_messages[user_id] = []
+            
+        except (json.JSONDecodeError, Exception):
+            pass
+    
+    # ==================== Public Methods ====================
     
     def set_persona(self, new_persona: str):
-        """Change the agent's persona dynamically.
-        
-        Args:
-            new_persona: The new personality/system prompt
-        """
+        """Change the agent's persona dynamically."""
         self.persona = new_persona
         self._config.persona = new_persona
         print(f"Agent {self.name}'s persona updated.")
     
     def add_collaborator(self, agent_name: str):
-        """Add an agent as a collaborator.
-        
-        Args:
-            agent_name: Name of the agent to add as collaborator
-        """
+        """Add an agent as a collaborator."""
         if agent_name not in self.collaborators:
             self.collaborators.append(agent_name)
             print(f"Added {agent_name} as a collaborator for {self.name}.")
     
     def remove_collaborator(self, agent_name: str):
-        """Remove an agent from collaborators.
-        
-        Args:
-            agent_name: Name of the agent to remove
-        """
+        """Remove an agent from collaborators."""
         if agent_name in self.collaborators:
             self.collaborators.remove(agent_name)
             print(f"Removed {agent_name} from collaborators for {self.name}.")
     
-    def store_memory(self, content: str, memory_type: str = "long_term"):
-        """Manually store a memory.
+    def store_user_memory(
+        self,
+        user_id: str,
+        content: str,
+        category: str = "general"
+    ):
+        """Manually store a fact about a user in long-term memory.
         
         Args:
-            content: Content to store
-            memory_type: Type of memory ("short_term" or "long_term")
+            user_id: User's email/ID
+            content: The fact/information to store
+            category: Category (e.g., "preference", "fact", "skill", "note")
         """
-        if memory_type == "short_term":
-            self._memory.store_short_term(content)
-        else:
-            embedding = self._embeddings.embed(content)
-            self._memory.store_long_term(content, embedding)
-        print(f"Memory stored in {memory_type}.")
+        embedding = self._embeddings.embed(content)
+        self._memory.store_long_term(
+            user_id=user_id,
+            content=content,
+            embedding=embedding,
+            category=category,
+            metadata={"source": "manual"}
+        )
+        print(f"Memory stored for user {user_id} in category '{category}'.")
     
-    def get_memory_stats(self) -> dict:
-        """Get statistics about the agent's memories.
+    def get_user_memories(
+        self,
+        user_id: str,
+        category: Optional[str] = None,
+        limit: int = 10
+    ) -> list[dict]:
+        """Get stored memories for a user.
         
+        Args:
+            user_id: User's email/ID
+            category: Optional category filter
+            limit: Max memories to return
+            
         Returns:
-            Dict with memory counts
+            List of memory documents
         """
+        return self._memory.get_user_long_term(user_id, limit, category)
+    
+    def get_user_stats(self, user_id: str) -> dict:
+        """Get memory statistics for a user."""
+        return self._memory.get_user_stats(user_id)
+    
+    def get_stats(self) -> dict:
+        """Get overall agent statistics."""
         return self._memory.get_stats()
     
-    def clear_memories(self, memory_type: Optional[str] = None):
-        """Clear memories.
+    def clear_user_memories(
+        self,
+        user_id: str,
+        memory_type: Optional[str] = None
+    ):
+        """Clear memories for a specific user.
         
         Args:
-            memory_type: Type to clear ("short_term", "conversation", or None for all)
+            user_id: User's email/ID
+            memory_type: "conversation", "short_term", "long_term", or None for all
         """
-        if memory_type == "short_term":
-            self._memory.clear_short_term()
-        elif memory_type == "conversation":
-            self._memory.clear_conversation()
-        elif memory_type is None:
-            self._memory.clear_all()
-        print(f"Cleared {memory_type or 'all'} memories.")
+        if memory_type == "conversation":
+            self._memory.clear_user_conversation(user_id)
+        elif memory_type == "short_term":
+            self._memory.clear_user_short_term(user_id)
+        elif memory_type == "long_term":
+            self._memory.clear_user_long_term(user_id)
+        else:
+            self._memory.clear_user_all(user_id)
+        print(f"Cleared {memory_type or 'all'} memories for user {user_id}.")
+    
+    def end_session(self, user_id: str):
+        """End a user session and save the summary.
+        
+        Call this when a user's session ends to ensure the session
+        summary is saved to short-term memory.
+        """
+        if user_id in self._session_messages and self._session_messages[user_id]:
+            self._update_short_term_summary(user_id)
+            print(f"Session ended for {user_id}. Summary saved to short-term memory.")
     
     def __repr__(self) -> str:
         return f"MongoAgent(name='{self.name}', provider='{self._llm.provider}')"

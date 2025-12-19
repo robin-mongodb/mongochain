@@ -64,14 +64,16 @@ class MemoryConfig:
     """Configuration for memory storage.
     
     Attributes:
-        short_term_ttl_seconds: TTL for short-term memories (default: 1 hour)
-        short_term_limit: Max short-term memories to retrieve
+        conversation_ttl_days: TTL for conversation history (default: 90 days)
+        short_term_ttl_days: TTL for short-term summaries (default: 7 days)
+        short_term_limit: Max short-term summaries to retrieve
         long_term_limit: Max long-term memories to retrieve via vector search
         conversation_limit: Max conversation messages to include in context
         embedding_dimensions: Dimensions of the embedding vectors
     """
-    short_term_ttl_seconds: int = 3600  # 1 hour
-    short_term_limit: int = 10
+    conversation_ttl_days: int = 90
+    short_term_ttl_days: int = 7
+    short_term_limit: int = 5
     long_term_limit: int = 5
     conversation_limit: int = 20
     embedding_dimensions: int = 1024  # voyage-3-lite default
