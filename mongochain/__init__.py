@@ -1,29 +1,22 @@
-"""MongoChain - MongoDB-backed agent memory framework."""
+"""Mongochain - MongoDB Atlas powered agent framework.
 
-from mongochain.core.agent import MongoAgent
-from mongochain.core.memory_store import MongoMemoryStore
-from mongochain.core.schemas import (
-    Memory,
-    Message,
-    Conversation,
-    UserProfile,
-    Episode,
-    AgentConfig,
-    SearchResult,
-)
-from mongochain.core.config import set_connection_string
+A simple Python library that demonstrates MongoDB Atlas as a memory layer
+for AI agents with multiple memory types and multi-agent collaboration.
+"""
+
+from .agent import MongoAgent
+from .config import AgentConfig, MemoryConfig
+from .embeddings import VoyageEmbeddings
+from .llm import LLMClient
+from .memory import MemoryStore
 
 __version__ = "0.1.0"
 
 __all__ = [
     "MongoAgent",
-    "MongoMemoryStore",
-    "Memory",
-    "Message",
-    "Conversation",
-    "UserProfile",
-    "Episode",
     "AgentConfig",
-    "SearchResult",
-    "set_connection_string",
+    "MemoryConfig",
+    "VoyageEmbeddings",
+    "LLMClient",
+    "MemoryStore",
 ]
