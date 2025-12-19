@@ -95,6 +95,7 @@ class MongoMemoryStore:
         try:
             # Get embedding dimensions based on model
             dimensions = get_embedding_dimensions(self.embedding_model)
+            print(f"  → Creating vector indexes (model: {self.embedding_model}, dimensions: {dimensions})")
             
             # Create vector index for short_term_memory collection
             self._create_vector_index_for_collection(
@@ -112,12 +113,37 @@ class MongoMemoryStore:
                 dimensions=dimensions
             )
             
-            print(f"  ✓ Vector indexes created (dimensions: {dimensions})")
+            print(f"  ✓ Vector indexes created successfully")
+            
+            # Verify indexes were created
+            self._verify_vector_indexes(dimensions)
         except Exception as e:
             # Don't fail initialization if vector index creation fails
             # (e.g., if not using Atlas or vector search not available)
-            print(f"  ⚠ Vector index creation skipped: {e}")
-            print(f"    (Vector search requires MongoDB Atlas with vector search enabled)")
+            print(f"  ⚠ Vector index creation failed: {type(e).__name__}: {e}")
+            print(f"    (Vector search requires MongoDB Atlas M10+ with vector search enabled)")
+            print(f"    (MongoDB version 7.0+ required)")
+            print(f"    You can verify indexes in Atlas UI: Collections > Search Indexes")
+    
+    def _verify_vector_indexes(self, expected_dimensions: int):
+        """Verify that vector indexes were created successfully."""
+        try:
+            for collection_name in [self.SHORT_TERM_COLLECTION, self.USER_PROFILES_COLLECTION]:
+                collection = self.db[collection_name]
+                try:
+                    indexes = list(collection.list_search_indexes())
+                    vector_indexes = [idx for idx in indexes if idx.get("name") == "vector_index"]
+                    if vector_indexes:
+                        idx = vector_indexes[0]
+                        status = idx.get("status", "unknown")
+                        print(f"    → Verified '{collection_name}': status={status}")
+                    else:
+                        print(f"    ⚠ No vector index found on '{collection_name}'")
+                except Exception as e:
+                    print(f"    ⚠ Could not verify indexes on '{collection_name}': {e}")
+        except Exception:
+            # Silently fail verification - not critical
+            pass
     
     def _create_vector_index_for_collection(
         self,
@@ -136,42 +162,106 @@ class MongoMemoryStore:
             dimensions: Number of dimensions in the embedding vectors
         """
         try:
+            collection = self.db[collection_name]
+            
             # Check if index already exists
-            existing_indexes = self.db.command({
-                "listSearchIndexes": collection_name
-            })
-            for idx in existing_indexes.get("indexes", []):
-                if idx.get("name") == index_name:
-                    # Index already exists, skip creation
-                    return
+            try:
+                existing_indexes = list(collection.list_search_indexes())
+                for idx in existing_indexes:
+                    if idx.get("name") == index_name:
+                        # Index already exists, skip creation
+                        print(f"    ✓ Vector index '{index_name}' already exists on {collection_name}")
+                        return
+            except Exception as list_error:
+                # If list_search_indexes fails, try to create anyway
+                print(f"    ⚠ Could not list existing indexes: {list_error}")
             
             # Create vector search index definition
+            # Using the correct format for MongoDB Atlas Vector Search
+            # Format: https://www.mongodb.com/docs/atlas/atlas-search/create-index/
             index_definition = {
                 "name": index_name,
                 "definition": {
-                    "fields": [
-                        {
-                            "type": "vector",
-                            "path": field_path,
-                            "numDimensions": dimensions,
-                            "similarity": "cosine"
+                    "mappings": {
+                        "dynamic": False,
+                        "fields": {
+                            field_path: {
+                                "type": "knnVector",
+                                "dimensions": dimensions,
+                                "similarity": "cosine"
+                            }
                         }
-                    ]
+                    }
                 }
             }
             
             # Create the vector search index
             # Note: This requires MongoDB Atlas with vector search enabled
-            self.db.command({
-                "createSearchIndexes": collection_name,
-                "indexes": [index_definition]
-            })
+            # MongoDB Atlas Vector Search uses the Search API, not regular indexes
+            
+            # Try using collection.create_search_index() method (pymongo 4.5+)
+            # This is the recommended way for Atlas Search indexes
+            if hasattr(collection, 'create_search_index'):
+                try:
+                    result = collection.create_search_index(index_definition)
+                    print(f"    ✓ Creating vector index '{index_name}' on {collection_name}")
+                    print(f"      Field: {field_path}, Dimensions: {dimensions}")
+                    if result:
+                        print(f"      Index ID: {result}")
+                    return
+                except Exception as method_error:
+                    error_msg = str(method_error)
+                    # If it's a known error, provide helpful message
+                    if "not authorized" in error_msg.lower():
+                        raise Exception(f"Not authorized to create search indexes. Check Atlas permissions.")
+                    elif "atlas" in error_msg.lower() or "search" in error_msg.lower():
+                        raise Exception(f"Atlas Search API error: {error_msg}")
+                    raise
+            
+            # Fallback: Use database command (for older pymongo or alternative setups)
+            # Format: { "createSearchIndexes": "collection_name", "indexes": [...] }
+            try:
+                result = self.db.command({
+                    "createSearchIndexes": collection_name,
+                    "indexes": [index_definition]
+                })
+                print(f"    ✓ Creating vector index '{index_name}' on {collection_name} (using command)")
+                print(f"      Field: {field_path}, Dimensions: {dimensions}")
+                if result:
+                    print(f"      Command result: {result}")
+                return
+            except OperationFailure as cmd_error:
+                error_msg = str(cmd_error)
+                error_lower = error_msg.lower()
+                
+                if "unknown command" in error_lower:
+                    raise Exception(
+                        f"createSearchIndexes command not recognized. "
+                        f"This might mean:\n"
+                        f"  1. You're not using MongoDB Atlas\n"
+                        f"  2. Your MongoDB version doesn't support vector search (needs 7.0+)\n"
+                        f"  3. Vector search is not enabled on your cluster"
+                    )
+                elif "not authorized" in error_lower or "unauthorized" in error_lower:
+                    raise Exception(f"Not authorized to create search indexes. Check database user permissions.")
+                elif "atlas" in error_lower:
+                    raise Exception(f"Atlas-specific error: {error_msg}")
+                else:
+                    raise Exception(f"Failed to create vector index: {error_msg}")
+            except Exception as e:
+                raise Exception(f"Unexpected error creating vector index: {type(e).__name__}: {e}")
         except OperationFailure as e:
             # Handle case where vector search is not available
-            # (e.g., not using Atlas, or feature not enabled)
-            if "vector" in str(e).lower() or "search" in str(e).lower():
-                raise
+            error_msg = str(e)
+            if "vector" in error_msg.lower() or "search" in error_msg.lower() or "atlas" in error_msg.lower():
+                raise Exception(f"Vector search not available: {error_msg}")
             # Re-raise other operation failures
+            raise
+        except Exception as e:
+            # Catch any other errors and provide helpful message
+            error_msg = str(e)
+            if "create_search_index" in error_msg or "createSearchIndex" in error_msg:
+                raise Exception(f"Failed to create vector index: {error_msg}")
             raise
     
     def store_memory(
