@@ -157,6 +157,75 @@ class MongoAgent:
         
         return response
     
+    def chat_stream(self, user_id: str, message: str):
+        """Send a message and stream the response.
+        
+        Args:
+            user_id: User's email or unique identifier
+            message: The user's message
+            
+        Yields:
+            Chunks of the agent's response text
+            
+        Note:
+            After iteration completes, memories are saved automatically.
+        """
+        from typing import Generator
+        
+        # Initialize session tracking for this user if needed
+        if user_id not in self._session_messages:
+            self._session_messages[user_id] = []
+        
+        # Generate embedding for the user message
+        message_embedding = self._embeddings.embed(message)
+        
+        # Store user message in conversation history (with embedding)
+        self._memory.store_conversation(
+            user_id=user_id,
+            role="user",
+            content=message,
+            embedding=message_embedding
+        )
+        
+        # Track in session
+        self._session_messages[user_id].append({"role": "user", "content": message})
+        
+        # Build context from all memory sources
+        context = self._build_context(user_id, message, message_embedding)
+        
+        # Build messages for LLM
+        messages = self._build_messages(user_id, message, context)
+        
+        # Stream response from LLM and collect full response
+        full_response = []
+        for chunk in self._llm.chat_stream(messages, system_prompt=self._build_system_prompt(user_id, context)):
+            full_response.append(chunk)
+            yield chunk
+        
+        # After streaming completes, save the response
+        response = "".join(full_response)
+        
+        # Generate embedding for the response
+        response_embedding = self._embeddings.embed(response)
+        
+        # Store assistant response (with embedding)
+        self._memory.store_conversation(
+            user_id=user_id,
+            role="assistant",
+            content=response,
+            embedding=response_embedding
+        )
+        
+        # Track in session
+        self._session_messages[user_id].append({"role": "assistant", "content": response})
+        
+        # Extract and store user facts in long-term memory
+        self._extract_and_store_user_facts(user_id, message, response)
+        
+        # Update short-term summary periodically
+        if len(self._session_messages[user_id]) >= 10:
+            self._update_short_term_summary(user_id)
+    
     def _build_context(
         self,
         user_id: str,

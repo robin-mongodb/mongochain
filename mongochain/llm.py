@@ -1,6 +1,6 @@
 """Multi-provider LLM abstraction for mongochain."""
 
-from typing import Optional
+from typing import Optional, Generator
 
 
 class LLMClient:
@@ -80,6 +80,29 @@ class LLMClient:
         elif self.provider == "google":
             return self._chat_google(messages, system_prompt)
     
+    def chat_stream(
+        self,
+        messages: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        """Send messages and stream response text.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            system_prompt: Optional system prompt to prepend
+            
+        Yields:
+            Chunks of the assistant's response text
+        """
+        if self.provider == "openai":
+            yield from self._stream_openai(messages, system_prompt)
+        elif self.provider == "anthropic":
+            yield from self._stream_anthropic(messages, system_prompt)
+        elif self.provider == "google":
+            yield from self._stream_google(messages, system_prompt)
+    
+    # ==================== OpenAI ====================
+    
     def _chat_openai(
         self,
         messages: list[dict],
@@ -100,6 +123,31 @@ class LLMClient:
         
         return response.choices[0].message.content
     
+    def _stream_openai(
+        self,
+        messages: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        """Stream chat for OpenAI."""
+        all_messages = []
+        
+        if system_prompt:
+            all_messages.append({"role": "system", "content": system_prompt})
+        
+        all_messages.extend(messages)
+        
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=all_messages,
+            stream=True
+        )
+        
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+    
+    # ==================== Anthropic ====================
+    
     def _chat_anthropic(
         self,
         messages: list[dict],
@@ -115,28 +163,65 @@ class LLMClient:
         
         return response.content[0].text
     
+    def _stream_anthropic(
+        self,
+        messages: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        """Stream chat for Anthropic Claude."""
+        with self._client.messages.stream(
+            model=self.model,
+            max_tokens=4096,
+            system=system_prompt or "",
+            messages=messages
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+    
+    # ==================== Google ====================
+    
     def _chat_google(
         self,
         messages: list[dict],
         system_prompt: Optional[str] = None
     ) -> str:
         """Handle chat for Google Gemini."""
-        # Convert messages to Gemini format
         history = []
         
-        for msg in messages[:-1]:  # All except the last message
+        for msg in messages[:-1]:
             role = "user" if msg["role"] == "user" else "model"
             history.append({"role": role, "parts": [msg["content"]]})
         
-        # Start chat with history
         chat = self._client.start_chat(history=history)
         
-        # Build the final prompt
         last_message = messages[-1]["content"] if messages else ""
         if system_prompt and not history:
-            # Prepend system prompt to first message if no history
             last_message = f"{system_prompt}\n\n{last_message}"
         
         response = chat.send_message(last_message)
         
         return response.text
+    
+    def _stream_google(
+        self,
+        messages: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> Generator[str, None, None]:
+        """Stream chat for Google Gemini."""
+        history = []
+        
+        for msg in messages[:-1]:
+            role = "user" if msg["role"] == "user" else "model"
+            history.append({"role": role, "parts": [msg["content"]]})
+        
+        chat = self._client.start_chat(history=history)
+        
+        last_message = messages[-1]["content"] if messages else ""
+        if system_prompt and not history:
+            last_message = f"{system_prompt}\n\n{last_message}"
+        
+        response = chat.send_message(last_message, stream=True)
+        
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
