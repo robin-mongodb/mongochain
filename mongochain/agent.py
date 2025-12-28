@@ -1,7 +1,7 @@
 """Main MongoAgent class for mongochain."""
 
 import json
-from typing import Optional
+from typing import Optional, Callable
 
 from .config import AgentConfig, MemoryConfig
 from .embeddings import VoyageEmbeddings
@@ -83,6 +83,9 @@ class MongoAgent:
         # Track current session for summarization
         self._session_messages: dict[str, list] = {}  # user_id -> messages
         
+        # Registered tools: name -> {"func": callable, "description": str, "parameters": dict}
+        self._tools: dict[str, dict] = {}
+        
         # Setup database and collections
         self._setup()
     
@@ -140,9 +143,13 @@ class MongoAgent:
         
         # Build messages for LLM
         messages = self._build_messages(user_id, message, context)
+        system_prompt = self._build_system_prompt(user_id, context)
         
-        # Get response from LLM
-        response = self._llm.chat(messages, system_prompt=self._build_system_prompt(user_id, context))
+        # Check if tools are available
+        if self._tools:
+            response = self._chat_with_tools(messages, system_prompt)
+        else:
+            response = self._llm.chat(messages, system_prompt=system_prompt)
         
         # Generate embedding for the response
         response_embedding = self._embeddings.embed(response)
@@ -166,6 +173,62 @@ class MongoAgent:
             self._update_short_term_summary(user_id)
         
         return response
+    
+    def _chat_with_tools(self, messages: list[dict], system_prompt: str) -> str:
+        """Handle chat with tool calling support.
+        
+        Args:
+            messages: The messages to send
+            system_prompt: The system prompt
+            
+        Returns:
+            The final response text
+        """
+        # Build tool definitions for the LLM
+        tools = [
+            {
+                "name": name,
+                "description": tool["description"],
+                "parameters": tool["parameters"]
+            }
+            for name, tool in self._tools.items()
+        ]
+        
+        # First call to LLM
+        result = self._llm.chat_with_tools(messages, tools, system_prompt)
+        
+        # If it's a tool call, execute it and get the result
+        if result["type"] == "tool_call":
+            tool_name = result["name"]
+            tool_args = result["arguments"]
+            
+            if tool_name in self._tools:
+                try:
+                    # Execute the tool
+                    tool_result = self._tools[tool_name]["func"](**tool_args)
+                    
+                    # Add tool result to messages and get final response
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"I'll use the {tool_name} tool to help answer this."
+                    })
+                    messages.append({
+                        "role": "user", 
+                        "content": f"Tool result from {tool_name}: {tool_result}"
+                    })
+                    
+                    # Get final response incorporating tool result
+                    final_response = self._llm.chat(messages, system_prompt=system_prompt)
+                    return final_response
+                    
+                except Exception as e:
+                    # Tool execution failed, inform the user
+                    return f"I tried to use the {tool_name} tool but encountered an error: {str(e)}"
+            else:
+                return f"Tool '{tool_name}' was requested but is not available."
+        
+        # Regular text response
+        return result["content"]
     
     def chat_stream(self, user_id: str, message: str):
         """Send a message and stream the response.
@@ -596,10 +659,93 @@ Only return valid JSON."""
             - llm_model: LLM model name
             - collaborators: List of collaborator agent names
             - description: Optional description
+            - tools: List of registered tool names
             - created_at: When the agent was first created
             - updated_at: When metadata was last modified
         """
         return self._memory.get_agent_metadata()
+    
+    # ==================== Tool Management ====================
+    
+    def register_tool(
+        self,
+        name: str,
+        func: Callable,
+        description: str,
+        parameters: dict
+    ):
+        """Register a custom tool/function for the agent to use.
+        
+        The tool will be persisted to MongoDB (metadata only) and available
+        for the agent to call during chat.
+        
+        Args:
+            name: Unique tool name (e.g., "get_weather")
+            func: The Python function to call
+            description: Human-readable description of what the tool does
+            parameters: JSON Schema describing the function parameters
+            
+        Example:
+            def get_weather(location: str, unit: str = "celsius") -> str:
+                # ... call weather API ...
+                return f"Weather in {location}: 22°{unit[0].upper()}"
+            
+            agent.register_tool(
+                name="get_weather",
+                func=get_weather,
+                description="Get the current weather for a location",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City name, e.g., 'London'"
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                            "description": "Temperature unit"
+                        }
+                    },
+                    "required": ["location"]
+                }
+            )
+        """
+        # Store function reference in memory
+        self._tools[name] = {
+            "func": func,
+            "description": description,
+            "parameters": parameters
+        }
+        
+        # Persist tool metadata to MongoDB
+        self._memory.register_tool(name, description, parameters)
+        
+        print(f"Tool '{name}' registered for agent {self.name}.")
+    
+    def get_tools(self) -> list[dict]:
+        """Get all registered tools.
+        
+        Returns:
+            List of tool definitions (from MongoDB)
+        """
+        return self._memory.get_tools()
+    
+    def remove_tool(self, name: str):
+        """Remove a registered tool.
+        
+        Args:
+            name: Tool name to remove
+        """
+        # Remove from runtime
+        if name in self._tools:
+            del self._tools[name]
+        
+        # Remove from MongoDB
+        if self._memory.remove_tool(name):
+            print(f"Tool '{name}' removed from agent {self.name}.")
+        else:
+            print(f"Tool '{name}' not found.")
     
     def clear_user_memories(
         self,

@@ -29,6 +29,7 @@ class MemoryStore:
     SHORT_TERM = "short_term_memory"
     LONG_TERM = "long_term_memory"
     AGENT_METADATA = "agent_metadata"
+    AGENT_TOOLS = "agent_tools"
     
     def __init__(
         self,
@@ -55,6 +56,7 @@ class MemoryStore:
         self._short_term = self._db[self.SHORT_TERM]
         self._long_term = self._db[self.LONG_TERM]
         self._agent_metadata = self._db[self.AGENT_METADATA]
+        self._agent_tools = self._db[self.AGENT_TOOLS]
     
     def setup_collections(self) -> dict:
         """Create collections and indexes.
@@ -69,7 +71,7 @@ class MemoryStore:
         }
         
         # Ensure collections exist
-        for coll_name in [self.CONVERSATION, self.SHORT_TERM, self.LONG_TERM, self.AGENT_METADATA]:
+        for coll_name in [self.CONVERSATION, self.SHORT_TERM, self.LONG_TERM, self.AGENT_METADATA, self.AGENT_TOOLS]:
             if coll_name not in self._db.list_collection_names():
                 self._db.create_collection(coll_name)
                 status["collections_created"].append(coll_name)
@@ -601,6 +603,95 @@ class MemoryStore:
             }
         )
         return result.modified_count > 0
+    
+    # ==================== Agent Tools ====================
+    
+    def register_tool(
+        self,
+        name: str,
+        description: str,
+        parameters: dict
+    ) -> str:
+        """Register a tool in the database.
+        
+        Args:
+            name: Unique tool name (e.g., "get_weather")
+            description: Human-readable description of what the tool does
+            parameters: JSON Schema for the tool's parameters
+            
+        Returns:
+            The tool name
+        """
+        now = datetime.now(timezone.utc)
+        
+        doc = {
+            "_id": name,
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+            "created_at": now,
+            "updated_at": now
+        }
+        
+        # Upsert the tool
+        self._agent_tools.replace_one(
+            {"_id": name},
+            doc,
+            upsert=True
+        )
+        
+        # Also update agent metadata with tool reference
+        self._agent_metadata.update_one(
+            {"_id": "agent_config"},
+            {
+                "$addToSet": {"tools": name},
+                "$set": {"updated_at": now}
+            }
+        )
+        
+        return name
+    
+    def get_tools(self) -> list[dict]:
+        """Get all registered tools.
+        
+        Returns:
+            List of tool documents
+        """
+        return list(self._agent_tools.find({}))
+    
+    def get_tool(self, name: str) -> Optional[dict]:
+        """Get a specific tool by name.
+        
+        Args:
+            name: Tool name
+            
+        Returns:
+            Tool document or None
+        """
+        return self._agent_tools.find_one({"_id": name})
+    
+    def remove_tool(self, name: str) -> bool:
+        """Remove a tool from the database.
+        
+        Args:
+            name: Tool name to remove
+            
+        Returns:
+            True if removed, False if not found
+        """
+        result = self._agent_tools.delete_one({"_id": name})
+        
+        # Also remove from agent metadata
+        if result.deleted_count > 0:
+            self._agent_metadata.update_one(
+                {"_id": "agent_config"},
+                {
+                    "$pull": {"tools": name},
+                    "$set": {"updated_at": datetime.now(timezone.utc)}
+                }
+            )
+            return True
+        return False
     
     # ==================== Utility Methods ====================
     

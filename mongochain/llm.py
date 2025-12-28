@@ -101,6 +101,31 @@ class LLMClient:
         elif self.provider == "google":
             yield from self._stream_google(messages, system_prompt)
     
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> dict:
+        """Send messages with tool definitions and handle tool calls.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            tools: List of tool definitions in OpenAI function format
+            system_prompt: Optional system prompt to prepend
+            
+        Returns:
+            Dict with either:
+            - {"type": "text", "content": str} for regular responses
+            - {"type": "tool_call", "name": str, "arguments": dict} for tool calls
+        """
+        if self.provider == "openai":
+            return self._chat_with_tools_openai(messages, tools, system_prompt)
+        elif self.provider == "anthropic":
+            return self._chat_with_tools_anthropic(messages, tools, system_prompt)
+        elif self.provider == "google":
+            return self._chat_with_tools_google(messages, tools, system_prompt)
+    
     # ==================== OpenAI ====================
     
     def _chat_openai(
@@ -225,3 +250,134 @@ class LLMClient:
         for chunk in response:
             if chunk.text:
                 yield chunk.text
+    
+    # ==================== Tool Calling ====================
+    
+    def _chat_with_tools_openai(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> dict:
+        """Handle tool calling for OpenAI."""
+        import json
+        
+        all_messages = []
+        if system_prompt:
+            all_messages.append({"role": "system", "content": system_prompt})
+        all_messages.extend(messages)
+        
+        # Convert tools to OpenAI format
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"]
+                }
+            }
+            for tool in tools
+        ]
+        
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=all_messages,
+            tools=openai_tools if openai_tools else None,
+            tool_choice="auto" if openai_tools else None
+        )
+        
+        message = response.choices[0].message
+        
+        # Check if the model wants to call a tool
+        if message.tool_calls:
+            tool_call = message.tool_calls[0]
+            return {
+                "type": "tool_call",
+                "name": tool_call.function.name,
+                "arguments": json.loads(tool_call.function.arguments)
+            }
+        
+        return {"type": "text", "content": message.content}
+    
+    def _chat_with_tools_anthropic(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> dict:
+        """Handle tool calling for Anthropic Claude."""
+        # Convert tools to Anthropic format
+        anthropic_tools = [
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": tool["parameters"]
+            }
+            for tool in tools
+        ]
+        
+        response = self._client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=system_prompt or "",
+            messages=messages,
+            tools=anthropic_tools if anthropic_tools else None
+        )
+        
+        # Check for tool use
+        for block in response.content:
+            if block.type == "tool_use":
+                return {
+                    "type": "tool_call",
+                    "name": block.name,
+                    "arguments": block.input
+                }
+        
+        # Return text content
+        for block in response.content:
+            if block.type == "text":
+                return {"type": "text", "content": block.text}
+        
+        return {"type": "text", "content": ""}
+    
+    def _chat_with_tools_google(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        system_prompt: Optional[str] = None
+    ) -> dict:
+        """Handle tool calling for Google Gemini."""
+        # Google Gemini tool calling requires different setup
+        # For now, fall back to regular chat with tool info in prompt
+        tool_descriptions = "\n".join(
+            f"- {t['name']}: {t['description']}" for t in tools
+        )
+        
+        enhanced_prompt = system_prompt or ""
+        if tools:
+            enhanced_prompt += f"\n\nYou have access to these tools:\n{tool_descriptions}\n"
+            enhanced_prompt += "If you need to use a tool, respond with: TOOL_CALL: tool_name(arg1=value1, arg2=value2)"
+        
+        response_text = self._chat_google(messages, enhanced_prompt)
+        
+        # Parse for tool calls
+        if "TOOL_CALL:" in response_text:
+            import re
+            match = re.search(r'TOOL_CALL:\s*(\w+)\((.*?)\)', response_text)
+            if match:
+                tool_name = match.group(1)
+                args_str = match.group(2)
+                # Parse simple arg=value pairs
+                arguments = {}
+                for arg in args_str.split(','):
+                    if '=' in arg:
+                        key, value = arg.split('=', 1)
+                        arguments[key.strip()] = value.strip().strip('"\'')
+                return {
+                    "type": "tool_call",
+                    "name": tool_name,
+                    "arguments": arguments
+                }
+        
+        return {"type": "text", "content": response_text}
