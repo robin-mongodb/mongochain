@@ -90,6 +90,16 @@ class MongoAgent:
         """Setup the agent's database and collections."""
         status = self._memory.setup_collections()
         
+        # Save agent metadata to MongoDB
+        self._memory.save_agent_metadata(
+            name=self.name,
+            persona=self.persona,
+            llm_provider=self._llm.provider,
+            llm_model=self._llm.model,
+            collaborators=self.collaborators,
+            description=None
+        )
+        
         print(f"Agent: {self.name} created. Check database '{self._config.db_name}' in your MongoDB cluster.")
         
         if status["collections_created"]:
@@ -480,21 +490,50 @@ Only return valid JSON."""
     # ==================== Public Methods ====================
     
     def set_persona(self, new_persona: str):
-        """Change the agent's persona dynamically."""
+        """Change the agent's persona dynamically.
+        
+        Updates both the in-memory persona and persists to MongoDB.
+        """
         self.persona = new_persona
         self._config.persona = new_persona
+        self._memory.update_agent_persona(new_persona)
         print(f"Agent {self.name}'s persona updated.")
     
+    def set_description(self, description: str):
+        """Set a human-readable description for the agent.
+        
+        Args:
+            description: A brief description of the agent's purpose
+        """
+        # Update the full metadata with new description
+        self._memory.save_agent_metadata(
+            name=self.name,
+            persona=self.persona,
+            llm_provider=self._llm.provider,
+            llm_model=self._llm.model,
+            collaborators=self.collaborators,
+            description=description
+        )
+        print(f"Agent {self.name}'s description updated.")
+    
     def add_collaborator(self, agent_name: str):
-        """Add an agent as a collaborator."""
+        """Add an agent as a collaborator.
+        
+        Updates both the in-memory list and persists to MongoDB.
+        """
         if agent_name not in self.collaborators:
             self.collaborators.append(agent_name)
+            self._memory.update_agent_collaborators(self.collaborators)
             print(f"Added {agent_name} as a collaborator for {self.name}.")
     
     def remove_collaborator(self, agent_name: str):
-        """Remove an agent from collaborators."""
+        """Remove an agent from collaborators.
+        
+        Updates both the in-memory list and persists to MongoDB.
+        """
         if agent_name in self.collaborators:
             self.collaborators.remove(agent_name)
+            self._memory.update_agent_collaborators(self.collaborators)
             print(f"Removed {agent_name} from collaborators for {self.name}.")
     
     def store_user_memory(
@@ -545,6 +584,22 @@ Only return valid JSON."""
     def get_stats(self) -> dict:
         """Get overall agent statistics."""
         return self._memory.get_stats()
+    
+    def get_metadata(self) -> Optional[dict]:
+        """Get the agent's persisted metadata from MongoDB.
+        
+        Returns:
+            Dict with agent metadata including:
+            - name: Agent name
+            - persona: Current personality/system prompt
+            - llm_provider: LLM provider name
+            - llm_model: LLM model name
+            - collaborators: List of collaborator agent names
+            - description: Optional description
+            - created_at: When the agent was first created
+            - updated_at: When metadata was last modified
+        """
+        return self._memory.get_agent_metadata()
     
     def clear_user_memories(
         self,

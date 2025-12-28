@@ -28,6 +28,7 @@ class MemoryStore:
     CONVERSATION = "conversation_history"
     SHORT_TERM = "short_term_memory"
     LONG_TERM = "long_term_memory"
+    AGENT_METADATA = "agent_metadata"
     
     def __init__(
         self,
@@ -53,6 +54,7 @@ class MemoryStore:
         self._conversation = self._db[self.CONVERSATION]
         self._short_term = self._db[self.SHORT_TERM]
         self._long_term = self._db[self.LONG_TERM]
+        self._agent_metadata = self._db[self.AGENT_METADATA]
     
     def setup_collections(self) -> dict:
         """Create collections and indexes.
@@ -67,7 +69,7 @@ class MemoryStore:
         }
         
         # Ensure collections exist
-        for coll_name in [self.CONVERSATION, self.SHORT_TERM, self.LONG_TERM]:
+        for coll_name in [self.CONVERSATION, self.SHORT_TERM, self.LONG_TERM, self.AGENT_METADATA]:
             if coll_name not in self._db.list_collection_names():
                 self._db.create_collection(coll_name)
                 status["collections_created"].append(coll_name)
@@ -495,6 +497,110 @@ class MemoryStore:
             {"embedding": 0}
         ).sort("timestamp", -1).limit(limit)
         return list(cursor)
+    
+    # ==================== Agent Metadata ====================
+    
+    def save_agent_metadata(
+        self,
+        name: str,
+        persona: str,
+        llm_provider: str,
+        llm_model: str,
+        collaborators: list[str],
+        description: Optional[str] = None
+    ) -> dict:
+        """Save or update agent metadata.
+        
+        Uses upsert to create on first call, update on subsequent calls.
+        
+        Args:
+            name: Agent name
+            persona: Agent personality/system prompt
+            llm_provider: LLM provider name
+            llm_model: LLM model name
+            collaborators: List of collaborator agent names
+            description: Optional human-readable description
+            
+        Returns:
+            The saved metadata document
+        """
+        now = datetime.now(timezone.utc)
+        
+        # Check if metadata already exists
+        existing = self._agent_metadata.find_one({"_id": "agent_config"})
+        
+        doc = {
+            "_id": "agent_config",
+            "name": name,
+            "persona": persona,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "collaborators": collaborators,
+            "description": description,
+            "updated_at": now
+        }
+        
+        if existing:
+            # Preserve created_at on update
+            doc["created_at"] = existing.get("created_at", now)
+        else:
+            doc["created_at"] = now
+        
+        self._agent_metadata.replace_one(
+            {"_id": "agent_config"},
+            doc,
+            upsert=True
+        )
+        
+        return doc
+    
+    def get_agent_metadata(self) -> Optional[dict]:
+        """Retrieve agent metadata.
+        
+        Returns:
+            The agent metadata document, or None if not found
+        """
+        return self._agent_metadata.find_one({"_id": "agent_config"})
+    
+    def update_agent_persona(self, persona: str) -> bool:
+        """Update only the agent's persona.
+        
+        Args:
+            persona: New persona/system prompt
+            
+        Returns:
+            True if updated, False if no metadata exists
+        """
+        result = self._agent_metadata.update_one(
+            {"_id": "agent_config"},
+            {
+                "$set": {
+                    "persona": persona,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
+        return result.modified_count > 0
+    
+    def update_agent_collaborators(self, collaborators: list[str]) -> bool:
+        """Update the agent's collaborators list.
+        
+        Args:
+            collaborators: New list of collaborator agent names
+            
+        Returns:
+            True if updated, False if no metadata exists
+        """
+        result = self._agent_metadata.update_one(
+            {"_id": "agent_config"},
+            {
+                "$set": {
+                    "collaborators": collaborators,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
+        return result.modified_count > 0
     
     # ==================== Utility Methods ====================
     
